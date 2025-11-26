@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  memory-manager:
+    build: .
+    container_name: mcp-memory-manager
+    restart: unless-stopped
+    volumes:
+      - ./memory-data:/data/memories
+    environment:
+      - MEMORY_BASE_PATH=/data/memories
+
+volumes:
+  memory-data:
+    driver: local
