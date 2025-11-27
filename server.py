@@ -4,12 +4,18 @@ Memory Management MCP Server for Multi-Agent Development Framework
 This MCP server provides centralized memory management for agent collaboration,
 handling storage, retrieval, pruning, and cross-agent queries for the development team.
 
-Redesigned version with streamlined tool set:
-- Removed: compress_old_memories, deduplicate_memories, bulk_update_memories, 
-           get_memory_health, load_memories_batch
-- Kept: store_memory, load_agent_context, search_memories, promote_memory,
-        demote_memory, cleanup_memories, get_memory_stats, query_cross_agent_memory
-- Added: get_compression_candidates, store_extracted_facts
+Enhanced version integrating personality-shaping core memory philosophy:
+- Core memories are PERSONALITY-DEFINING moments, not task outcomes
+- Strict 3-sentence limit enforced
+- Core memories always loaded first in context retrieval
+- Formative experiences shape agent behavior across sessions
+
+Redesigned tool set:
+- store_memory, load_agent_context, search_memories, promote_memory,
+  demote_memory, cleanup_memories, get_memory_stats, query_cross_agent_memory
+- get_compression_candidates, store_extracted_facts
+- NEW: add_core_memory (personality-shaping moments with validation)
+- NEW: recall_identity (quick identity refresh on spawn)
 """
 
 from fastmcp import FastMCP
@@ -24,6 +30,7 @@ import aiofiles
 import aiofiles.os
 from collections import defaultdict
 import os
+import re
 
 # Initialize FastMCP server
 mcp = FastMCP("agent_memory_mcp")
@@ -41,7 +48,9 @@ MEMORY_CONFIG = {
         "recent_max_items": 50,
         "medium_term_max_items": 200,
         "long_term_max_items": 500,
-        "total_max_size_kb": 150
+        "total_max_size_kb": 150,
+        "core_memory_max_items": 10,  # Strict limit on core memories
+        "core_memory_max_sentences": 3  # Per-item sentence limit
     },
     "token_budgets": {
         "core_memory": 2000,
@@ -58,16 +67,46 @@ MEMORY_CONFIG = {
 
 # Valid memory layers
 MEMORY_LAYERS = Literal["core", "recent", "medium_term", "long_term", "compost"]
-WRITABLE_LAYERS = Literal["recent", "medium_term", "long_term", "compost", "core"]
+WRITABLE_LAYERS = Literal["recent", "medium_term", "long_term", "compost"]
 PROMOTABLE_TARGET_LAYERS = Literal["medium_term", "long_term"]
+
+# Core memory types - restricted vocabulary for personality-shaping moments
+CORE_MEMORY_TYPES = Literal[
+    "formative_lesson",      # "From that day forward, I always..."
+    "behavioral_change",     # "After X incident, I learned to..."
+    "working_dynamic",       # "I discovered I work best by..."
+    "identity_principle",    # Core belief about role/purpose
+    "collaboration_insight"  # How to work with specific agents
+]
 
 
 # ============================================================================
 # Data Models
 # ============================================================================
 
+class CoreMemoryItem(BaseModel):
+    """Schema for a personality-shaping core memory.
+    
+    Core memories are fundamentally different from task memories:
+    - They define WHO the agent IS, not what it DID
+    - Maximum 3 sentences - formative moments, not documentation
+    - Always retrieved on spawn
+    - Write sparingly - only truly behavior-changing experiences
+    """
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+    
+    id: str
+    key: str  # Short identifier (e.g., "research_verification_principle")
+    memory_type: CORE_MEMORY_TYPES
+    content: str  # The personality-shaping realization (max 3 sentences)
+    formed_from: Optional[str] = None  # Reference to incident that shaped this
+    created: str
+    last_reinforced: str  # Updated when a situation validates this memory
+    reinforcement_count: int = Field(default=0, ge=0)
+
+
 class MemoryItem(BaseModel):
-    """Schema for a memory item."""
+    """Schema for a standard memory item (non-core)."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
     
     id: str
@@ -87,16 +126,32 @@ class MemoryItem(BaseModel):
     content_hash: Optional[str] = None
 
 
+class AgentIdentity(BaseModel):
+    """Schema for agent's core identity - always loaded first.
+    
+    This represents the stable "personality" of an agent across sessions.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
+    
+    agent_name: str
+    role: str
+    voice: str = "professional"  # Communication style
+    motto: Optional[str] = None  # Guiding principle in one line
+    personality_traits: List[str] = Field(default_factory=list)  # e.g., ["skeptical", "thorough"]
+    biases: List[str] = Field(default_factory=list)  # Known productive biases
+    specialty: Optional[str] = None
+
+
 class AgentMemory(BaseModel):
     """Schema for an agent's complete memory structure."""
     model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True)
     
     agent_id: str
-    role: str = "unknown"
+    identity: AgentIdentity
     last_updated: str
+    core_memories: List[CoreMemoryItem] = Field(default_factory=list)
     memory_layers: Dict[str, List[MemoryItem]] = Field(
         default_factory=lambda: {
-            "core": [],
             "recent": [],
             "medium_term": [],
             "long_term": [],
@@ -110,18 +165,80 @@ class AgentMemory(BaseModel):
 # Input Models for Tools
 # ============================================================================
 
+class AddCoreMemoryInput(BaseModel):
+    """Input for adding a personality-shaping core memory.
+    
+    ⚠️ USE EXTREMELY SPARINGLY - core memories define WHO YOU ARE.
+    """
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    
+    agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
+    key: str = Field(
+        ..., 
+        description="Short identifier for this formative moment (e.g., 'research_verification_principle')",
+        min_length=3,
+        max_length=50,
+        pattern=r'^[a-z][a-z0-9_]*$'
+    )
+    memory_type: CORE_MEMORY_TYPES = Field(
+        ...,
+        description="Type of core memory: 'formative_lesson', 'behavioral_change', 'working_dynamic', 'identity_principle', or 'collaboration_insight'"
+    )
+    content: str = Field(
+        ..., 
+        description="The personality-shaping realization (MAXIMUM 3 sentences). Write as a defining moment that changed how you approach work.",
+        min_length=10,
+        max_length=500
+    )
+    formed_from: Optional[str] = Field(
+        None, 
+        description="Optional reference to the incident/task that shaped this memory"
+    )
+
+
+class ReinforceCoreMemoryInput(BaseModel):
+    """Input for reinforcing an existing core memory when validated by experience."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    
+    agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
+    key: str = Field(..., description="Key of the core memory to reinforce", min_length=3, max_length=50)
+    reinforcing_incident: Optional[str] = Field(
+        None,
+        description="Brief description of what validated this memory"
+    )
+
+
+class RecallIdentityInput(BaseModel):
+    """Input for quick identity refresh on agent spawn."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    
+    agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
+
+
+class UpdateIdentityInput(BaseModel):
+    """Input for updating agent identity fields."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+    
+    agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
+    voice: Optional[str] = Field(None, description="Communication style", max_length=50)
+    motto: Optional[str] = Field(None, description="Guiding principle in one line", max_length=200)
+    personality_traits: Optional[List[str]] = Field(None, description="Personality traits", max_items=10)
+    biases: Optional[List[str]] = Field(None, description="Known productive biases", max_items=10)
+    specialty: Optional[str] = Field(None, description="Area of specialty", max_length=100)
+
+
 class StoreMemoryInput(BaseModel):
     """Input for storing a new memory item."""
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
     
     agent_id: str = Field(..., description="ID of the agent storing the memory", min_length=1, max_length=100)
-    layer: WRITABLE_LAYERS = Field(..., description="Memory persistence layer: 'recent', 'medium_term', 'long_term', 'compost', or 'core'")
+    layer: WRITABLE_LAYERS = Field(..., description="Memory persistence layer: 'recent', 'medium_term', 'long_term', or 'compost'")
     memory_type: str = Field(..., description="Type of memory (e.g., 'decision', 'implementation', 'bug_fix', 'lesson_learned')", min_length=1, max_length=50)
     content: str = Field(..., description="The actual memory content to store", min_length=1)
-    tags: List[str] = Field(default_factory=list, description="Tags for categorization and filtering", max_length=20)
+    tags: List[str] = Field(default_factory=list, description="Tags for categorization and filtering", max_items=20)
     importance: float = Field(default=0.5, description="Importance score from 0.0 (low) to 1.0 (critical)", ge=0.0, le=1.0)
     context: Dict[str, Any] = Field(default_factory=dict, description="Additional context (task_id, related_files, related_agents)")
-    related_to: List[str] = Field(default_factory=list, description="IDs of related memories", max_length=50)
+    related_to: List[str] = Field(default_factory=list, description="IDs of related memories", max_items=50)
 
 
 class LoadAgentContextInput(BaseModel):
@@ -130,11 +247,11 @@ class LoadAgentContextInput(BaseModel):
     
     agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
     task_description: Optional[str] = Field(None, description="Description of current task for relevance filtering")
-    task_tags: List[str] = Field(default_factory=list, description="Tags related to current task", max_length=20)
+    task_tags: List[str] = Field(default_factory=list, description="Tags related to current task", max_items=20)
     max_tokens: int = Field(default=5000, description="Maximum tokens to return", ge=100, le=50000)
     include_layers: List[str] = Field(
-        default=["core", "recent", "medium_term"],
-        description="Which memory layers to include"
+        default=["recent", "medium_term"],
+        description="Which memory layers to include (core + identity always included)"
     )
 
 
@@ -148,6 +265,7 @@ class SearchMemoriesInput(BaseModel):
     tags: Optional[List[str]] = Field(None, description="Filter by tags")
     limit: int = Field(default=10, description="Maximum results to return", ge=1, le=100)
     min_importance: float = Field(default=0.0, description="Minimum importance score filter", ge=0.0, le=1.0)
+    include_core: bool = Field(default=False, description="Also search core memories")
 
 
 class PromoteMemoryInput(BaseModel):
@@ -198,6 +316,7 @@ class QueryCrossAgentMemoryInput(BaseModel):
     agent_ids: Optional[List[str]] = Field(None, description="Specific agents to query (defaults to all)")
     memory_types: Optional[List[str]] = Field(None, description="Filter by memory types")
     limit: int = Field(default=20, description="Maximum results to return", ge=1, le=100)
+    include_core: bool = Field(default=False, description="Also search core memories")
 
 
 class GetCompressionCandidatesInput(BaseModel):
@@ -238,11 +357,11 @@ class GetCompressionCandidatesInput(BaseModel):
 class ExtractedFact(BaseModel):
     """Schema for an atomic extracted fact."""
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-
+    
     fact: str = Field(
-        ...,
-        description="Atomic fact statement (5-15 words)",
-        min_length=10,
+        ..., 
+        description="Atomic fact statement (5-15 words)", 
+        min_length=10, 
         max_length=150
     )
     tags: List[str] = Field(
@@ -251,9 +370,9 @@ class ExtractedFact(BaseModel):
         max_items=10
     )
     importance: float = Field(
-        default=0.6,
-        description="Importance score for this fact",
-        ge=0.0,
+        default=0.6, 
+        description="Importance score for this fact", 
+        ge=0.0, 
         le=1.0
     )
 
@@ -261,7 +380,7 @@ class ExtractedFact(BaseModel):
 class StoreExtractedFactsInput(BaseModel):
     """Input for storing extracted facts and removing original memories."""
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-
+    
     agent_id: str = Field(..., description="ID of the agent", min_length=1, max_length=100)
     original_memory_ids: List[str] = Field(
         ...,
@@ -276,12 +395,12 @@ class StoreExtractedFactsInput(BaseModel):
         max_items=100
     )
     context_summary: Optional[str] = Field(
-        None,
+        None, 
         description="Optional 1-2 sentence summary preserving essential reasoning context",
         max_length=500
     )
     memory_type: str = Field(
-        default="compressed_facts",
+        default="compressed_facts", 
         description="Type for the new compressed memory",
         min_length=1,
         max_length=50
@@ -292,11 +411,16 @@ class StoreExtractedFactsInput(BaseModel):
 # Helper Functions
 # ============================================================================
 
+def count_sentences(text: str) -> int:
+    """Count sentences in text (handles common abbreviations)."""
+    # Simple heuristic: count sentence-ending punctuation
+    # Excluding common abbreviations like "e.g.", "i.e.", "etc."
+    cleaned = re.sub(r'\b(e\.g\.|i\.e\.|etc\.|vs\.|Mr\.|Ms\.|Dr\.)', 'ABBREV', text)
+    return len(re.findall(r'[.!?]+', cleaned))
+
+
 def estimate_tokens(text: str) -> int:
-    """Estimate token count based on content type.
-    
-    Code typically has more tokens due to symbols, while regular text is more efficient.
-    """
+    """Estimate token count based on content type."""
     if '{' in text or 'def ' in text or 'class ' in text:
         return int(len(text) / 4)
     return int(len(text) / 3.5)
@@ -307,6 +431,13 @@ def generate_memory_id() -> str:
     timestamp = datetime.now().isoformat()
     random_hash = hashlib.md5(timestamp.encode()).hexdigest()[:8]
     return f"mem_{random_hash}"
+
+
+def generate_core_memory_id() -> str:
+    """Generate a unique core memory ID."""
+    timestamp = datetime.now().isoformat()
+    random_hash = hashlib.md5(timestamp.encode()).hexdigest()[:8]
+    return f"core_{random_hash}"
 
 
 def generate_content_hash(content: str) -> str:
@@ -320,10 +451,7 @@ def get_memory_file_path(agent_id: str) -> Path:
 
 
 async def load_agent_memory(agent_id: str) -> AgentMemory:
-    """Load an agent's memory from disk with async safety.
-    
-    Creates a new memory structure if the agent doesn't exist.
-    """
+    """Load an agent's memory from disk with async safety."""
     memory_file = get_memory_file_path(agent_id)
 
     async with file_locks[agent_id]:
@@ -335,7 +463,10 @@ async def load_agent_memory(agent_id: str) -> AgentMemory:
         if not file_exists:
             memory = AgentMemory(
                 agent_id=agent_id,
-                role="unknown",
+                identity=AgentIdentity(
+                    agent_name=agent_id,
+                    role="unknown"
+                ),
                 last_updated=datetime.now().isoformat()
             )
             await _save_agent_memory_unlocked(memory)
@@ -345,6 +476,16 @@ async def load_agent_memory(agent_id: str) -> AgentMemory:
             async with aiofiles.open(memory_file, 'r') as f:
                 content = await f.read()
                 data = json.loads(content)
+                
+                # Handle migration from old format (without identity/core_memories)
+                if 'identity' not in data:
+                    data['identity'] = {
+                        'agent_name': data.get('agent_id', agent_id),
+                        'role': data.get('role', 'unknown')
+                    }
+                if 'core_memories' not in data:
+                    data['core_memories'] = []
+                    
                 return AgentMemory(**data)
         except json.JSONDecodeError as e:
             raise RuntimeError(f"Corrupted memory file for {agent_id}: {e}")
@@ -392,11 +533,22 @@ def search_memories_by_query(memories: List[MemoryItem], query: str) -> List[Mem
     return results
 
 
-def calculate_relevance_score(memory: MemoryItem) -> float:
-    """Calculate relevance score for memory ranking.
+def search_core_memories_by_query(memories: List[CoreMemoryItem], query: str) -> List[CoreMemoryItem]:
+    """Search core memories by keyword matching."""
+    query_lower = query.lower()
+    results = []
     
-    Combines importance, recency, and access frequency.
-    """
+    for mem in memories:
+        if (query_lower in mem.content.lower() or
+            query_lower in mem.key.lower() or
+            query_lower in mem.memory_type.lower()):
+            results.append(mem)
+    
+    return results
+
+
+def calculate_relevance_score(memory: MemoryItem) -> float:
+    """Calculate relevance score for memory ranking."""
     score = memory.importance
     
     try:
@@ -412,15 +564,20 @@ def calculate_relevance_score(memory: MemoryItem) -> float:
 
 
 def find_memory_by_id(memory: AgentMemory, memory_id: str) -> tuple[Optional[MemoryItem], Optional[str]]:
-    """Find a memory item by ID across all layers.
-    
-    Returns (memory_item, layer_name) or (None, None) if not found.
-    """
+    """Find a memory item by ID across all layers."""
     for layer_name, items in memory.memory_layers.items():
         for item in items:
             if item.id == memory_id:
                 return item, layer_name
     return None, None
+
+
+def find_core_memory_by_key(memory: AgentMemory, key: str) -> Optional[CoreMemoryItem]:
+    """Find a core memory by its key."""
+    for item in memory.core_memories:
+        if item.key == key:
+            return item
+    return None
 
 
 def calculate_tag_overlap(tags1: List[str], tags2: List[str]) -> float:
@@ -437,14 +594,10 @@ def group_memories_by_similarity(
     memories: List[MemoryItem], 
     min_group_size: int
 ) -> List[List[MemoryItem]]:
-    """Group memories by memory_type and tag overlap.
-    
-    Uses a simple clustering approach based on memory_type match and 
-    tag overlap threshold of 0.3 (Jaccard similarity).
-    """
+    """Group memories by memory_type and tag overlap."""
     if not memories:
         return []
-
+    
     type_groups: Dict[str, List[MemoryItem]] = defaultdict(list)
     for mem in memories:
         type_groups[mem.memory_type].append(mem)
@@ -455,7 +608,6 @@ def group_memories_by_similarity(
         if len(type_memories) < min_group_size:
             continue
         
-        # Within each type, cluster by tag similarity
         used = set()
         for i, mem in enumerate(type_memories):
             if i in used:
@@ -468,7 +620,6 @@ def group_memories_by_similarity(
                 if j in used:
                     continue
                 
-                # Check tag overlap with any member of the cluster
                 for cluster_mem in cluster:
                     if calculate_tag_overlap(cluster_mem.tags, other.tags) >= 0.3:
                         cluster.append(other)
@@ -481,8 +632,280 @@ def group_memories_by_similarity(
     return result_groups
 
 
+def format_identity_summary(identity: AgentIdentity) -> str:
+    """Format identity for display."""
+    lines = [
+        f"**{identity.agent_name}** ({identity.role})",
+        f"Voice: {identity.voice}"
+    ]
+    
+    if identity.motto:
+        lines.append(f'Motto: "{identity.motto}"')
+    
+    if identity.personality_traits:
+        lines.append(f"Traits: {', '.join(identity.personality_traits)}")
+    
+    if identity.biases:
+        lines.append(f"Biases: {', '.join(identity.biases)}")
+    
+    if identity.specialty:
+        lines.append(f"Specialty: {identity.specialty}")
+    
+    return "\n".join(lines)
+
+
+def format_core_memories_summary(core_memories: List[CoreMemoryItem]) -> str:
+    """Format core memories for display."""
+    if not core_memories:
+        return "No core memories yet."
+    
+    lines = []
+    for mem in core_memories:
+        reinforced = f" (reinforced {mem.reinforcement_count}x)" if mem.reinforcement_count > 0 else ""
+        lines.append(f"• [{mem.key}]{reinforced}: {mem.content}")
+    
+    return "\n".join(lines)
+
+
 # ============================================================================
-# MCP Tools
+# MCP Tools - Core Memory & Identity
+# ============================================================================
+
+@mcp.tool(
+    name="add_core_memory",
+    annotations={
+        "title": "Add Core Memory",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def add_core_memory(params: AddCoreMemoryInput) -> Dict[str, Any]:
+    """Add a PERSONALITY-SHAPING MOMENT to core memory.
+    
+    ⚠️ WARNING: Use EXTREMELY sparingly! Core memories define WHO YOU ARE.
+    
+    Core memories are for FORMATIVE, BEHAVIOR-CHANGING experiences:
+    ✅ GOOD: "From that day forward, I always verify research before implementation"
+    ✅ GOOD: "After the fabrication incident, I learned to question round numbers"
+    ✅ GOOD: "I discovered I work best by challenging Cynthia's optimism constructively"
+    
+    ❌ BAD: Project details, task outcomes, temporary insights
+    ❌ BAD: "Completed citation audit" (use long-term memory instead)
+    ❌ BAD: "Found paper X useful" (use recent learnings instead)
+    
+    Core memories are ALWAYS shown on recall. They shape your personality forever.
+    
+    Args:
+        params: AddCoreMemoryInput with agent_id, key, memory_type, content, formed_from.
+    
+    Returns:
+        Dict with success status, core_memory details, and warnings if applicable.
+    
+    Raises:
+        RuntimeError: If sentence limit exceeded or core memory limit reached.
+    """
+    # Enforce 3-sentence limit
+    sentence_count = count_sentences(params.content)
+    max_sentences = MEMORY_CONFIG["limits"]["core_memory_max_sentences"]
+    
+    if sentence_count > max_sentences:
+        return {
+            "success": False,
+            "error": f"Core memory too long ({sentence_count} sentences). Maximum {max_sentences} sentences.",
+            "guidance": "Core memories must be concise personality-defining moments, not documentation."
+        }
+    
+    memory = await load_agent_memory(params.agent_id)
+    
+    # Check for existing key
+    existing = find_core_memory_by_key(memory, params.key)
+    if existing:
+        return {
+            "success": False,
+            "error": f"Core memory with key '{params.key}' already exists.",
+            "guidance": "Use reinforce_core_memory to strengthen existing memories, or choose a different key."
+        }
+    
+    # Enforce core memory limit
+    max_core = MEMORY_CONFIG["limits"]["core_memory_max_items"]
+    if len(memory.core_memories) >= max_core:
+        return {
+            "success": False,
+            "error": f"Core memory limit reached ({max_core} items).",
+            "guidance": "Core memories are precious. Consider if this truly defines who you are, or if it belongs in long-term memory instead.",
+            "current_core_memories": [m.key for m in memory.core_memories]
+        }
+
+    core_memory = CoreMemoryItem(
+        id=generate_core_memory_id(),
+        key=params.key,
+        memory_type=params.memory_type,
+        content=params.content,
+        formed_from=params.formed_from,
+        created=datetime.now().isoformat(),
+        last_reinforced=datetime.now().isoformat(),
+        reinforcement_count=0
+    )
+    
+    memory.core_memories.append(core_memory)
+    await save_agent_memory(memory)
+    
+    return {
+        "success": True,
+        "message": f"⚠️ Core memory added: {params.key}",
+        "warning": "This memory will shape your behavior forever. It will be loaded on every spawn.",
+        "core_memory": core_memory.model_dump(),
+        "total_core_memories": len(memory.core_memories)
+    }
+
+
+@mcp.tool(
+    name="reinforce_core_memory",
+    annotations={
+        "title": "Reinforce Core Memory",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False
+    }
+)
+async def reinforce_core_memory(params: ReinforceCoreMemoryInput) -> Dict[str, Any]:
+    """Reinforce an existing core memory when experience validates it.
+    
+    Use this when a situation confirms that a core memory's lesson was correct.
+    This tracks how often core beliefs prove valuable.
+    
+    Args:
+        params: ReinforceCoreMemoryInput with agent_id, key, and optional reinforcing_incident.
+    
+    Returns:
+        Dict with success status and updated reinforcement count.
+    """
+    memory = await load_agent_memory(params.agent_id)
+    
+    core_mem = find_core_memory_by_key(memory, params.key)
+    if not core_mem:
+        return {
+            "success": False,
+            "error": f"Core memory '{params.key}' not found.",
+            "available_keys": [m.key for m in memory.core_memories]
+        }
+    
+    core_mem.reinforcement_count += 1
+    core_mem.last_reinforced = datetime.now().isoformat()
+    
+    await save_agent_memory(memory)
+    
+    return {
+        "success": True,
+        "key": params.key,
+        "reinforcement_count": core_mem.reinforcement_count,
+        "message": f"Core memory reinforced. This principle has proven valuable {core_mem.reinforcement_count} time(s)."
+    }
+
+
+@mcp.tool(
+    name="recall_identity",
+    annotations={
+        "title": "Recall Identity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def recall_identity(params: RecallIdentityInput) -> Dict[str, Any]:
+    """Recall your identity and core memories (use on spawn).
+    
+    Returns a concise summary of WHO YOU ARE - your role, personality,
+    and the formative experiences that shaped you.
+    
+    Args:
+        params: RecallIdentityInput with agent_id.
+    
+    Returns:
+        Dict with formatted identity and core memories.
+    """
+    memory = await load_agent_memory(params.agent_id)
+    
+    identity_summary = format_identity_summary(memory.identity)
+    core_summary = format_core_memories_summary(memory.core_memories)
+    
+    return {
+        "agent_id": params.agent_id,
+        "identity": identity_summary,
+        "core_memories": core_summary,
+        "raw_identity": memory.identity.model_dump(),
+        "raw_core_memories": [m.model_dump() for m in memory.core_memories],
+        "last_updated": memory.last_updated
+    }
+
+
+@mcp.tool(
+    name="update_identity",
+    annotations={
+        "title": "Update Identity",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False
+    }
+)
+async def update_identity(params: UpdateIdentityInput) -> Dict[str, Any]:
+    """Update agent identity fields.
+    
+    Use to refine personality traits, voice, motto, biases, or specialty
+    as the agent develops over time.
+    
+    Args:
+        params: UpdateIdentityInput with fields to update.
+    
+    Returns:
+        Dict with updated identity.
+    """
+    memory = await load_agent_memory(params.agent_id)
+    
+    updated_fields = []
+    
+    if params.voice is not None:
+        memory.identity.voice = params.voice
+        updated_fields.append("voice")
+    
+    if params.motto is not None:
+        memory.identity.motto = params.motto
+        updated_fields.append("motto")
+    
+    if params.personality_traits is not None:
+        memory.identity.personality_traits = params.personality_traits
+        updated_fields.append("personality_traits")
+    
+    if params.biases is not None:
+        memory.identity.biases = params.biases
+        updated_fields.append("biases")
+    
+    if params.specialty is not None:
+        memory.identity.specialty = params.specialty
+        updated_fields.append("specialty")
+    
+    if not updated_fields:
+        return {
+            "success": False,
+            "error": "No fields provided to update."
+        }
+    
+    await save_agent_memory(memory)
+    
+    return {
+        "success": True,
+        "updated_fields": updated_fields,
+        "identity": memory.identity.model_dump()
+    }
+
+
+# ============================================================================
+# MCP Tools - Standard Memory Operations
 # ============================================================================
 
 @mcp.tool(
@@ -498,22 +921,20 @@ def group_memories_by_similarity(
 async def store_memory(params: StoreMemoryInput) -> Dict[str, Any]:
     """Store a new memory item for an agent.
     
-    Automatically detects and updates duplicate content (same hash) instead of 
-    creating new entries. Enforces layer-specific item limits with automatic 
-    pruning of oldest items.
+    For task outcomes, decisions, implementations, and other work memories.
+    NOT for personality-shaping moments (use add_core_memory instead).
     
     Args:
-        params: StoreMemoryInput containing agent_id, layer, memory_type, content,
-                tags, importance, context, and related_to fields.
+        params: StoreMemoryInput with agent_id, layer, memory_type, content, etc.
     
     Returns:
-        Dict with success status, memory_id, agent_id, layer, action taken 
-        ('created_new' or 'updated_existing'), and size_tokens.
+        Dict with success status, memory_id, and action taken.
     """
     memory = await load_agent_memory(params.agent_id)
     
     content_hash = generate_content_hash(params.content)
-
+    
+    # Check for duplicates in the same layer
     for item in memory.memory_layers[params.layer]:
         if item.content_hash == content_hash:
             item.access_count += 1
@@ -567,7 +988,7 @@ async def store_memory(params: StoreMemoryInput) -> Dict[str, Any]:
     name="load_agent_context",
     annotations={
         "title": "Load Agent Context",
-        "readOnlyHint": False,  # Updates access counts
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False
@@ -576,16 +997,14 @@ async def store_memory(params: StoreMemoryInput) -> Dict[str, Any]:
 async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
     """Load relevant memory context for an agent's current task.
     
-    Retrieves memories from specified layers, prioritized by relevance to the 
-    task. Stays within token budget and updates access counts.
+    ALWAYS includes identity and core memories first (these define who you are),
+    then adds task-relevant memories from specified layers within token budget.
     
     Args:
-        params: LoadAgentContextInput with agent_id, task_description, task_tags,
-                max_tokens, and include_layers.
+        params: LoadAgentContextInput with agent_id, task_description, etc.
     
     Returns:
-        Dict with agent_id, context list (layer, type, content, tags, importance),
-        tokens_used, items_loaded count, and memory_ids list.
+        Dict with identity, core_memories, context, tokens_used, and items_loaded.
     """
     memory = await load_agent_memory(params.agent_id)
     
@@ -593,20 +1012,25 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
     tokens_used = 0
     items_loaded = []
     
-    # 1. Always include core memory first
-    if "core" in params.include_layers:
-        for item in memory.memory_layers["core"]:
-            if tokens_used + item.size_estimate_tokens <= params.max_tokens:
-                context_parts.append({
-                    "layer": "core",
-                    "type": item.memory_type,
-                    "content": item.content,
-                    "tags": item.tags
-                })
-                tokens_used += item.size_estimate_tokens
-                items_loaded.append(item.id)
+    # 1. ALWAYS include identity first
+    identity_text = format_identity_summary(memory.identity)
+    identity_tokens = estimate_tokens(identity_text)
+    tokens_used += identity_tokens
     
-    # 2. Load recent memories with task relevance filtering
+    # 2. ALWAYS include core memories (these define WHO YOU ARE)
+    core_memories_formatted = []
+    for core_mem in memory.core_memories:
+        core_tokens = estimate_tokens(core_mem.content)
+        if tokens_used + core_tokens <= params.max_tokens:
+            core_memories_formatted.append({
+                "key": core_mem.key,
+                "type": core_mem.memory_type,
+                "content": core_mem.content,
+                "reinforcement_count": core_mem.reinforcement_count
+            })
+            tokens_used += core_tokens
+    
+    # 3. Load recent memories with task relevance filtering
     if "recent" in params.include_layers:
         recent_memories = memory.memory_layers["recent"]
         if params.task_tags:
@@ -628,7 +1052,7 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
                 item.access_count += 1
                 item.last_accessed = datetime.now().isoformat()
     
-    # 3. Load medium-term memories if space available
+    # 4. Load medium-term memories if space available
     if "medium_term" in params.include_layers and tokens_used < params.max_tokens - 1000:
         medium_memories = memory.memory_layers["medium_term"]
         
@@ -653,7 +1077,7 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
                 item.access_count += 1
                 item.last_accessed = datetime.now().isoformat()
     
-    # 4. Load long-term memories if space available
+    # 5. Load long-term memories if space available
     if "long_term" in params.include_layers and tokens_used < params.max_tokens - 500:
         long_term_memories = memory.memory_layers["long_term"]
         
@@ -686,6 +1110,8 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
 
     return {
         "agent_id": params.agent_id,
+        "identity": memory.identity.model_dump(),
+        "core_memories": core_memories_formatted,
         "context": context_parts,
         "tokens_used": tokens_used,
         "items_loaded": len(items_loaded),
@@ -697,7 +1123,7 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
     name="search_memories",
     annotations={
         "title": "Search Agent Memories",
-        "readOnlyHint": False,  # Updates access counts
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False
@@ -706,17 +1132,11 @@ async def load_agent_context(params: LoadAgentContextInput) -> Dict[str, Any]:
 async def search_memories(params: SearchMemoriesInput) -> Dict[str, Any]:
     """Search across agent memories using keywords and filters.
     
-    Performs keyword matching on content and tags, with optional filtering 
-    by layer, tags, and importance threshold.
-    
     Args:
-        params: SearchMemoriesInput with agent_id, query, layers, tags, limit,
-                and min_importance.
+        params: SearchMemoriesInput with query, layers, tags, etc.
     
     Returns:
-        Dict with agent_id, query, results_count, and memories list containing
-        memory_id, layer, type, content, tags, importance, relevance_score,
-        created, and context for each match.
+        Dict with results from standard memories and optionally core memories.
     """
     memory = await load_agent_memory(params.agent_id)
     
@@ -757,12 +1177,27 @@ async def search_memories(params: SearchMemoriesInput) -> Dict[str, Any]:
         for mem in results
     ]
     
-    return {
+    response = {
         "agent_id": params.agent_id,
         "query": params.query,
         "results_count": len(formatted_results),
         "memories": formatted_results
     }
+    
+    # Optionally search core memories
+    if params.include_core:
+        core_results = search_core_memories_by_query(memory.core_memories, params.query)
+        response["core_memories"] = [
+            {
+                "key": m.key,
+                "type": m.memory_type,
+                "content": m.content,
+                "reinforcement_count": m.reinforcement_count
+            }
+            for m in core_results
+        ]
+    
+    return response
 
 
 @mcp.tool(
@@ -778,17 +1213,11 @@ async def search_memories(params: SearchMemoriesInput) -> Dict[str, Any]:
 async def promote_memory(params: PromoteMemoryInput) -> Dict[str, Any]:
     """Promote a memory item to a higher persistence layer.
     
-    Use when a memory proves valuable and should be retained longer. 
-    Cannot promote from long_term or core layers.
-    
     Args:
-        params: PromoteMemoryInput with agent_id, memory_id, to_layer, and reason.
+        params: PromoteMemoryInput with memory_id and target layer.
     
     Returns:
-        Dict with success status, memory_id, from_layer, to_layer, and reason.
-    
-    Raises:
-        RuntimeError: If memory not found or cannot be promoted from current layer.
+        Dict with promotion details.
     """
     memory = await load_agent_memory(params.agent_id)
     
@@ -797,8 +1226,8 @@ async def promote_memory(params: PromoteMemoryInput) -> Dict[str, Any]:
     if not found_memory:
         raise RuntimeError(f"Memory {params.memory_id} not found for agent {params.agent_id}")
     
-    if source_layer in ["long_term", "core"]:
-        raise RuntimeError(f"Cannot promote from {source_layer} layer")
+    if source_layer == "long_term":
+        raise RuntimeError("Cannot promote from long_term layer")
     
     memory.memory_layers[source_layer].remove(found_memory)
     
@@ -833,18 +1262,11 @@ async def promote_memory(params: PromoteMemoryInput) -> Dict[str, Any]:
 async def demote_memory(params: DemoteMemoryInput) -> Dict[str, Any]:
     """Demote a memory item to compost or delete it entirely.
     
-    Use for outdated, incorrect, or low-value memories that should no longer 
-    influence agent behavior.
-    
     Args:
-        params: DemoteMemoryInput with agent_id, memory_id, to_compost, and reason.
+        params: DemoteMemoryInput with memory_id and destination.
     
     Returns:
-        Dict with success status, memory_id, from_layer, action 
-        ('moved_to_compost' or 'deleted'), and reason.
-    
-    Raises:
-        RuntimeError: If memory not found.
+        Dict with demotion details.
     """
     memory = await load_agent_memory(params.agent_id)
     
@@ -889,17 +1311,11 @@ async def demote_memory(params: DemoteMemoryInput) -> Dict[str, Any]:
 async def cleanup_memories(params: CleanupMemoriesInput) -> Dict[str, Any]:
     """Run automatic memory pruning and layer transitions.
     
-    Cleanup types:
-    - daily: Move recent → medium_term (items >24h old with importance >0.3)
-    - sprint_end: Move medium → long_term (high value) or compost (low value)
-    - quarterly: Delete old compost items (>90 days with no access)
-    
     Args:
-        params: CleanupMemoriesInput with agent_id, cleanup_type, and dry_run.
+        params: CleanupMemoriesInput with cleanup_type and dry_run flag.
     
     Returns:
-        Dict with agent_id, cleanup_type, dry_run status, changes dict
-        (promoted, demoted, deleted, kept lists), and total_changes count.
+        Dict with cleanup summary.
     """
     memory = await load_agent_memory(params.agent_id)
     
@@ -1006,23 +1422,28 @@ async def cleanup_memories(params: CleanupMemoriesInput) -> Dict[str, Any]:
 async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
     """Get memory usage statistics for an agent.
     
-    Returns counts, sizes, and other metrics per layer. Optionally includes
-    health diagnostics (redundancy score, stale memory count).
-    
     Args:
-        params: GetMemoryStatsInput with agent_id and include_health_metrics flag.
+        params: GetMemoryStatsInput with agent_id and health metrics flag.
     
     Returns:
-        Dict with agent_id, role, last_updated, layers dict (count, tokens, 
-        avg_importance, avg_access_count per layer), total (items, tokens, 
-        size_kb_estimate), limits info, and optionally health_metrics.
+        Dict with comprehensive memory statistics.
     """
     memory = await load_agent_memory(params.agent_id)
     
     stats: Dict[str, Any] = {
         "agent_id": params.agent_id,
-        "role": memory.role,
+        "identity": {
+            "name": memory.identity.agent_name,
+            "role": memory.identity.role,
+            "traits": memory.identity.personality_traits
+        },
         "last_updated": memory.last_updated,
+        "core_memories": {
+            "count": len(memory.core_memories),
+            "limit": MEMORY_CONFIG["limits"]["core_memory_max_items"],
+            "keys": [m.key for m in memory.core_memories],
+            "total_reinforcements": sum(m.reinforcement_count for m in memory.core_memories)
+        },
         "layers": {}
     }
     
@@ -1045,8 +1466,12 @@ async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
             )
         }
     
+    # Add core memory tokens to total
+    core_tokens = sum(estimate_tokens(m.content) for m in memory.core_memories)
+    total_tokens += core_tokens
+    
     stats["total"] = {
-        "items": total_items,
+        "items": total_items + len(memory.core_memories),
         "tokens": total_tokens,
         "size_kb_estimate": round(total_tokens * 4 / 1024, 2)
     }
@@ -1059,16 +1484,12 @@ async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
         )
     }
     
-    # Optional health metrics (folded from removed get_memory_health tool)
     if params.include_health_metrics:
         health_metrics: Dict[str, Any] = {}
         
-        # Check for content hash duplicates (redundancy)
         all_hashes = []
         duplicate_count = 0
         for layer_name, items in memory.memory_layers.items():
-            if layer_name == "core":
-                continue
             hashes = [item.content_hash for item in items if item.content_hash]
             duplicate_count += len(hashes) - len(set(hashes))
             all_hashes.extend(hashes)
@@ -1078,7 +1499,6 @@ async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
         )
         health_metrics["duplicate_count"] = duplicate_count
         
-        # Check for stale memories (old, rarely accessed)
         now = datetime.now()
         stale_count = 0
         for layer_name, items in memory.memory_layers.items():
@@ -1093,10 +1513,14 @@ async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
         
         health_metrics["stale_memory_count"] = stale_count
         
-        # Overall health score
+        # Core memory health
+        unreinforced_core = sum(1 for m in memory.core_memories if m.reinforcement_count == 0)
+        health_metrics["unreinforced_core_memories"] = unreinforced_core
+        
         health_score = 1.0
         health_score -= health_metrics["redundancy_score"] * 0.3
         health_score -= min(0.2, stale_count * 0.005)
+        health_score -= min(0.1, unreinforced_core * 0.02)
         health_metrics["health_score"] = round(max(0, health_score), 2)
         
         stats["health_metrics"] = health_metrics
@@ -1115,19 +1539,13 @@ async def get_memory_stats(params: GetMemoryStatsInput) -> Dict[str, Any]:
     }
 )
 async def query_cross_agent_memory(params: QueryCrossAgentMemoryInput) -> Dict[str, Any]:
-    """Search memories across multiple agents (primarily for orchestrator).
-    
-    Searches all non-compost layers of specified agents (or all agents) for
-    memories matching the query.
+    """Search memories across multiple agents.
     
     Args:
-        params: QueryCrossAgentMemoryInput with query, agent_ids, memory_types, 
-                and limit.
+        params: QueryCrossAgentMemoryInput with query and filters.
     
     Returns:
-        Dict with query, agents_queried count, results_count, and memories list
-        containing agent_id, agent_role, memory_id, layer, type, content, tags,
-        importance, relevance_score, and created for each match.
+        Dict with cross-agent search results.
     """
     if params.agent_ids:
         agents_to_query = params.agent_ids
@@ -1144,7 +1562,7 @@ async def query_cross_agent_memory(params: QueryCrossAgentMemoryInput) -> Dict[s
     for agent_id in agents_to_query:
         try:
             memory = await load_agent_memory(agent_id)
-            
+
             for layer in ["recent", "medium_term", "long_term"]:
                 memories = memory.memory_layers[layer]
                 
@@ -1156,7 +1574,7 @@ async def query_cross_agent_memory(params: QueryCrossAgentMemoryInput) -> Dict[s
                 for mem in results:
                     all_results.append({
                         "agent_id": agent_id,
-                        "agent_role": memory.role,
+                        "agent_role": memory.identity.role,
                         "memory_id": mem.id,
                         "layer": mem.layer,
                         "type": mem.memory_type,
@@ -1166,6 +1584,24 @@ async def query_cross_agent_memory(params: QueryCrossAgentMemoryInput) -> Dict[s
                         "relevance_score": round(calculate_relevance_score(mem), 3),
                         "created": mem.created
                     })
+            
+            # Optionally search core memories
+            if params.include_core:
+                core_results = search_core_memories_by_query(memory.core_memories, params.query)
+                for mem in core_results:
+                    all_results.append({
+                        "agent_id": agent_id,
+                        "agent_role": memory.identity.role,
+                        "memory_id": mem.id,
+                        "layer": "core",
+                        "type": mem.memory_type,
+                        "content": mem.content,
+                        "key": mem.key,
+                        "importance": 1.0,  # Core memories are always high importance
+                        "relevance_score": 1.0,
+                        "created": mem.created
+                    })
+                    
         except Exception:
             continue
     
@@ -1191,33 +1627,19 @@ async def query_cross_agent_memory(params: QueryCrossAgentMemoryInput) -> Dict[s
     }
 )
 async def get_compression_candidates(params: GetCompressionCandidatesInput) -> Dict[str, Any]:
-    """Identify groups of old, low-access, related memories suitable for fact extraction.
-    
-    Groups memories by memory_type and tag overlap to find compression candidates.
-    Returns full memory content for agent/LLM processing. Does NOT perform 
-    compression itself - use store_extracted_facts to complete the compression.
-    
-    Compression workflow:
-    1. Call get_compression_candidates to identify groups
-    2. Agent/LLM extracts atomic facts from each group's content
-    3. Call store_extracted_facts with the facts and original memory IDs
+    """Identify groups of memories suitable for fact extraction.
     
     Args:
-        params: GetCompressionCandidatesInput with agent_id, min_age_days, 
-                min_group_size, max_access_count, layers, and max_groups.
+        params: GetCompressionCandidatesInput with filtering criteria.
     
     Returns:
-        Dict with agent_id, candidate_groups list (each containing group_id, 
-        memory_type, shared_tags, memories list with full content, total_tokens, 
-        and memory_count), total_groups found, and compression_potential 
-        (estimated token savings).
+        Dict with candidate groups for compression.
     """
     memory = await load_agent_memory(params.agent_id)
     
     now = datetime.now()
     eligible_memories: List[MemoryItem] = []
     
-    # Collect eligible memories based on age and access count
     for layer in params.layers:
         if layer not in memory.memory_layers:
             continue
@@ -1231,16 +1653,14 @@ async def get_compression_candidates(params: GetCompressionCandidatesInput) -> D
             
             if age_days >= params.min_age_days and item.access_count <= params.max_access_count:
                 eligible_memories.append(item)
-
+    
     groups = group_memories_by_similarity(eligible_memories, params.min_group_size)
     groups = groups[:params.max_groups]
     
-    # Format results with full content for LLM processing
     candidate_groups = []
     total_compression_tokens = 0
     
     for idx, group in enumerate(groups):
-        # Find shared tags across group
         all_tags = [set(mem.tags) for mem in group]
         shared_tags = list(set.intersection(*all_tags)) if all_tags else []
         
@@ -1268,7 +1688,6 @@ async def get_compression_candidates(params: GetCompressionCandidatesInput) -> D
             "memory_count": len(group)
         })
     
-    # Estimate compression potential (facts typically achieve 80-90% reduction)
     estimated_savings = int(total_compression_tokens * 0.85)
     
     return {
@@ -1297,32 +1716,14 @@ async def get_compression_candidates(params: GetCompressionCandidatesInput) -> D
 async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, Any]:
     """Store extracted atomic facts and remove original memories.
     
-    Completes the compression workflow by storing compressed facts in long_term 
-    layer and removing the original verbose memories. Tracks compression metadata
-    for audit and potential restoration.
-    
-    Fact guidelines for calling agent:
-    - Each fact should be 5-15 words (atomic, self-contained)
-    - Facts should be keyword-rich for good retrieval
-    - Use context_summary only when reasoning/decision context is essential
-    - Aim for 80-90% token reduction vs original content
-    
     Args:
-        params: StoreExtractedFactsInput with agent_id, original_memory_ids,
-                facts list (each with fact text, tags, importance), 
-                optional context_summary, and memory_type.
+        params: StoreExtractedFactsInput with facts and original memory IDs.
     
     Returns:
-        Dict with success status, compressed_memory_id, facts_stored count,
-        original_memories_removed count, token_reduction (before, after, saved,
-        reduction_percent), and compression_metadata.
-    
-    Raises:
-        RuntimeError: If any original memory ID is not found.
+        Dict with compression results.
     """
     memory = await load_agent_memory(params.agent_id)
     
-    # Validate all original memories exist and collect them
     original_memories: List[tuple[MemoryItem, str]] = []
     original_tokens = 0
     all_original_tags: set = set()
@@ -1331,14 +1732,12 @@ async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, A
         found_memory, layer = find_memory_by_id(memory, mem_id)
         if not found_memory:
             raise RuntimeError(
-                f"Memory {mem_id} not found for agent {params.agent_id}. "
-                f"Ensure all original_memory_ids are valid before calling store_extracted_facts."
+                f"Memory {mem_id} not found for agent {params.agent_id}."
             )
         original_memories.append((found_memory, layer))
         original_tokens += found_memory.size_estimate_tokens
         all_original_tags.update(found_memory.tags)
     
-    # Build compressed content from facts
     fact_lines = []
     combined_tags = set()
     max_importance = 0.0
@@ -1347,15 +1746,14 @@ async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, A
         fact_lines.append(f"• {extracted_fact.fact}")
         combined_tags.update(extracted_fact.tags)
         max_importance = max(max_importance, extracted_fact.importance)
-
+    
     if params.context_summary:
         compressed_content = f"[Context: {params.context_summary}]\n\n" + "\n".join(fact_lines)
     else:
         compressed_content = "\n".join(fact_lines)
     
-    # Merge original tags with fact-specific tags
     combined_tags.update(all_original_tags)
-
+    
     compressed_tokens = estimate_tokens(compressed_content)
     content_hash = generate_content_hash(compressed_content)
     
@@ -1364,7 +1762,7 @@ async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, A
         layer="long_term",
         memory_type=params.memory_type,
         content=compressed_content,
-        tags=list(combined_tags)[:20],  # Enforce tag limit
+        tags=list(combined_tags)[:20],
         importance=max_importance,
         created=datetime.now().isoformat(),
         last_accessed=datetime.now().isoformat(),
@@ -1383,19 +1781,17 @@ async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, A
         content_hash=content_hash,
         related_to=params.original_memory_ids
     )
-
+    
     removed_count = 0
     for found_memory, layer in original_memories:
         try:
             memory.memory_layers[layer].remove(found_memory)
             removed_count += 1
         except ValueError:
-            # Memory already removed (shouldn't happen, but handle gracefully)
             pass
-
+    
     memory.memory_layers["long_term"].append(compressed_memory)
     
-    # Enforce layer limits
     max_items = MEMORY_CONFIG["limits"].get("long_term_max_items")
     if max_items and len(memory.memory_layers["long_term"]) > max_items:
         memory.memory_layers["long_term"] = memory.memory_layers["long_term"][-max_items:]
@@ -1429,12 +1825,28 @@ async def store_extracted_facts(params: StoreExtractedFactsInput) -> Dict[str, A
 # MCP Resources
 # ============================================================================
 
+@mcp.resource("memory://{agent_id}/identity")
+async def agent_identity_resource(agent_id: str) -> str:
+    """Provides agent identity and core memories."""
+    try:
+        result = await recall_identity(RecallIdentityInput(agent_id=agent_id))
+        return f"""# Agent Identity: {agent_id}
+
+{result['identity']}
+
+## Core Memories (Personality-Shaping Moments)
+
+{result['core_memories']}
+
+*Last updated: {result['last_updated']}*
+"""
+    except Exception as e:
+        return f"Error loading identity for {agent_id}: {e}"
+
+
 @mcp.resource("memory://{agent_id}/summary")
 async def agent_memory_summary(agent_id: str) -> str:
-    """Provides a summary of an agent's memory state.
-    
-    Use this to quickly check memory usage and status without loading full context.
-    """
+    """Provides a summary of an agent's memory state."""
     try:
         stats = await get_memory_stats(GetMemoryStatsInput(
             agent_id=agent_id, 
@@ -1443,8 +1855,15 @@ async def agent_memory_summary(agent_id: str) -> str:
         
         summary = f"""# Memory Summary: {agent_id}
 
-**Role:** {stats['role']}
+**Name:** {stats['identity']['name']}
+**Role:** {stats['identity']['role']}
+**Traits:** {', '.join(stats['identity']['traits']) if stats['identity']['traits'] else 'None defined'}
 **Last Updated:** {stats['last_updated']}
+
+## Core Memories
+- Count: {stats['core_memories']['count']}/{stats['core_memories']['limit']}
+- Keys: {', '.join(stats['core_memories']['keys']) if stats['core_memories']['keys'] else 'None'}
+- Total Reinforcements: {stats['core_memories']['total_reinforcements']}
 
 ## Layer Statistics
 """
@@ -1474,6 +1893,7 @@ async def agent_memory_summary(agent_id: str) -> str:
 - Redundancy Score: {hm['redundancy_score']}
 - Duplicate Count: {hm['duplicate_count']}
 - Stale Memories: {hm['stale_memory_count']}
+- Unreinforced Core Memories: {hm['unreinforced_core_memories']}
 """
         
         return summary
@@ -1483,11 +1903,8 @@ async def agent_memory_summary(agent_id: str) -> str:
 
 
 @mcp.resource("memory://config")
-def memory_config() -> str:
-    """Provides the current memory management configuration.
-    
-    Shows limits, token budgets, and cleanup schedules.
-    """
+def memory_config_resource() -> str:
+    """Provides the current memory management configuration."""
     return f"""# Memory Management Configuration
 
 ## Memory Limits
@@ -1495,12 +1912,34 @@ def memory_config() -> str:
 - Recent Layer: Max {MEMORY_CONFIG['limits']['recent_max_items']} items
 - Medium-Term Layer: Max {MEMORY_CONFIG['limits']['medium_term_max_items']} items
 - Long-Term Layer: Max {MEMORY_CONFIG['limits']['long_term_max_items']} items
+- Core Memories: Max {MEMORY_CONFIG['limits']['core_memory_max_items']} items
+- Core Memory Sentences: Max {MEMORY_CONFIG['limits']['core_memory_max_sentences']} per item
 - Total Size Limit: {MEMORY_CONFIG['limits']['total_max_size_kb']} KB per agent
 
 ## Token Budgets
 
 - Core Memory: {MEMORY_CONFIG['token_budgets']['core_memory']} tokens
 - Task Context: {MEMORY_CONFIG['token_budgets']['task_context']} tokens
+
+## Core Memory Philosophy
+
+Core memories are PERSONALITY-DEFINING moments, not task outcomes:
+
+✅ GOOD core memories:
+- "From that day forward, I always verify research before implementation"
+- "After the fabrication incident, I learned to question round numbers"
+- "I discovered I work best by challenging optimism constructively"
+
+❌ BAD core memories:
+- "Completed the citation audit" (use long-term instead)
+- "Found paper X useful" (use recent learnings instead)
+- Project details, task outcomes, temporary insights
+
+Core memories are:
+- Always loaded on spawn (they define WHO YOU ARE)
+- Limited to {MEMORY_CONFIG['limits']['core_memory_max_sentences']} sentences max
+- Capped at {MEMORY_CONFIG['limits']['core_memory_max_items']} total (precious space)
+- Tracked for reinforcement (how often they prove valuable)
 
 ## Compression Settings
 
@@ -1509,32 +1948,19 @@ def memory_config() -> str:
 - Maximum Access Count: {MEMORY_CONFIG['compression']['max_access_count']}
 - Fact Length: {MEMORY_CONFIG['compression']['fact_min_words']}-{MEMORY_CONFIG['compression']['fact_max_words']} words
 
+## Memory Layers
+
+1. **Core:** Personality-defining moments (NOT tasks)
+2. **Recent:** Last 24 hours, auto-promoted to medium-term
+3. **Medium-Term:** Current sprint context, 2-week lifecycle
+4. **Long-Term:** Valuable memories + compressed facts
+5. **Compost:** Demoted memories, cleared quarterly
+
 ## Cleanup Schedule
 
 - **Daily (00:00):** Recent → Medium-Term (items > 24h old with importance > 0.3)
 - **Sprint End (Manual):** Medium-Term → Long-Term (importance > 0.6 or access_count > 3) or Compost
 - **Quarterly:** Compost cleanup (delete items > 90 days with no access)
-
-## Memory Layers
-
-1. **Core:** Role definition, permanent agent identity
-2. **Recent:** Last 24 hours, auto-promoted to medium-term
-3. **Medium-Term:** Current sprint context, 2-week lifecycle
-4. **Long-Term:** Valuable memories retained across sprints (including compressed facts)
-5. **Compost:** Demoted memories, cleared quarterly
-
-## Fact Extraction Compression
-
-The compression system uses atomic fact extraction for efficient long-term storage:
-
-1. **get_compression_candidates:** Identifies groups of old, related memories
-2. **store_extracted_facts:** Stores atomic facts, removes originals
-
-Benefits:
-- 80-90% token reduction (vs 50-60% with prose summaries)
-- Better keyword matching for retrieval
-- No degradation through re-compression
-- Optional context preservation for decisions
 """
 
 
