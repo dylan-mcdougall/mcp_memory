@@ -32,8 +32,11 @@ mcp = FastMCP("agent_memory_mcp")
 MEMORY_BASE_PATH = Path(os.getenv("MEMORY_BASE_PATH", ".claude/agents/memories"))
 MEMORY_BASE_PATH.mkdir(parents=True, exist_ok=True)
 
+AUDIT_LOG_PATH = MEMORY_BASE_PATH / "audit.log"
+
 # File lock for async safety
 file_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+audit_lock = asyncio.Lock()
 
 # Memory limits configuration
 MEMORY_CONFIG = {
@@ -434,12 +437,12 @@ def calculate_tag_overlap(tags1: List[str], tags2: List[str]) -> float:
 
 
 def group_memories_by_similarity(
-    memories: List[MemoryItem], 
+    memories: List[MemoryItem],
     min_group_size: int
 ) -> List[List[MemoryItem]]:
     """Group memories by memory_type and tag overlap.
-    
-    Uses a simple clustering approach based on memory_type match and 
+
+    Uses a simple clustering approach based on memory_type match and
     tag overlap threshold of 0.3 (Jaccard similarity).
     """
     if not memories:
@@ -448,37 +451,61 @@ def group_memories_by_similarity(
     type_groups: Dict[str, List[MemoryItem]] = defaultdict(list)
     for mem in memories:
         type_groups[mem.memory_type].append(mem)
-    
+
     result_groups = []
-    
+
     for memory_type, type_memories in type_groups.items():
         if len(type_memories) < min_group_size:
             continue
-        
+
         # Within each type, cluster by tag similarity
         used = set()
         for i, mem in enumerate(type_memories):
             if i in used:
                 continue
-            
+
             cluster = [mem]
             used.add(i)
-            
+
             for j, other in enumerate(type_memories):
                 if j in used:
                     continue
-                
+
                 # Check tag overlap with any member of the cluster
                 for cluster_mem in cluster:
                     if calculate_tag_overlap(cluster_mem.tags, other.tags) >= 0.3:
                         cluster.append(other)
                         used.add(j)
                         break
-            
+
             if len(cluster) >= min_group_size:
                 result_groups.append(cluster)
-    
+
     return result_groups
+
+
+async def audit(agent_id: str, action: str, details: str = "") -> None:
+    """Log all memory operations for debugging and accountability.
+
+    Writes audit entries to a persistent log file with format:
+    timestamp | agent_id | action | details
+
+    Args:
+        agent_id: ID of the agent performing the operation
+        action: Type of action (e.g., 'store_memory', 'promote_memory')
+        details: Additional context about the operation
+    """
+    timestamp = datetime.now().isoformat()
+    entry = f"{timestamp} | {agent_id} | {action} | {details}\n"
+
+    async with audit_lock:
+        try:
+            async with aiofiles.open(AUDIT_LOG_PATH, 'a') as f:
+                await f.write(entry)
+        except Exception as e:
+            # Don't fail the operation if audit logging fails
+            # In production, consider logging this to a separate error log
+            print(f"Audit log write failed: {e}", flush=True)
 
 
 # ============================================================================
@@ -519,6 +546,14 @@ async def store_memory(params: StoreMemoryInput) -> Dict[str, Any]:
             item.access_count += 1
             item.last_accessed = datetime.now().isoformat()
             await save_agent_memory(memory)
+
+            # Audit log
+            await audit(
+                params.agent_id,
+                "store_memory",
+                f"updated_existing | layer={params.layer} | type={params.memory_type} | mem_id={item.id}"
+            )
+
             return {
                 "success": True,
                 "memory_id": item.id,
@@ -552,6 +587,13 @@ async def store_memory(params: StoreMemoryInput) -> Dict[str, Any]:
         memory.memory_layers[params.layer] = memory.memory_layers[params.layer][-max_items:]
 
     await save_agent_memory(memory)
+
+    # Audit log
+    await audit(
+        params.agent_id,
+        "store_memory",
+        f"created_new | layer={params.layer} | type={params.memory_type} | mem_id={memory_item.id} | tokens={memory_item.size_estimate_tokens}"
+    )
 
     return {
         "success": True,
